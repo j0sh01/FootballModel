@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment variables
+.env
+.env.local
+
+# Data (download separately)
+data/epl/
+data/championship/
+data/bundesliga1/
+data/bundesliga2/
+data/seriea/
+data/serieb/
+data/laliga/
+data/laligab/
+data/ligue1/
+data/ligue2/
+data/cached_features/
+data/combined/
+
+# Models (retrain with train_all.py or train_from_cache.py)
+models/
+
+# Outputs (regenerate with notebooks)
+outputs/
+
+# Legacy model files at root
+*.pkl
+
+# Compiled
+*.pyc
+
+# Legacy root-level CSV files
+*.csv
