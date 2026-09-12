@@ -16,11 +16,19 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 from contextlib import asynccontextmanager
+import time
+import uuid
 
 from api.service import get_service, PredictionService
+from src.data_loader import LEAGUE_CONFIG
+
+#: league key -> display name, used in batch responses
+LEAGUE_NAME = {key: cfg['name'] for key, cfg in LEAGUE_CONFIG.items()}
 
 
 # =============================================================================
@@ -107,6 +115,7 @@ class ModelInfo(BaseModel):
     accuracy: Optional[float]
     mae: Optional[float]
     n_features: int
+    members: Optional[List[str]] = Field(None, description="Member algorithms when the model is an ensemble")
 
 
 class PredictionResult(BaseModel):
@@ -117,6 +126,7 @@ class PredictionResult(BaseModel):
     predicted_value: Optional[float] = None
     model_type: Optional[str] = None
     market_type: Optional[str] = None
+    members: Optional[List[str]] = Field(None, description="Member algorithms when the model is an ensemble")
     error: Optional[str] = None
 
 
@@ -146,8 +156,14 @@ class TeamComparison(BaseModel):
 # Endpoints
 # =============================================================================
 
-@app.get("/", tags=["Root"])
+@app.get("/", include_in_schema=False)
 def root():
+    """Send browsers to the test console UI."""
+    return RedirectResponse(url="/ui/")
+
+
+@app.get("/api/info", tags=["Root"])
+def info():
     """API health check."""
     service = get_service()
     total_models = sum(len(m) for m in service.models.values())
@@ -157,6 +173,7 @@ def root():
         "version": "1.0.0",
         "total_models": total_models,
         "leagues_available": len(service.models),
+        "ui": "/ui/",
         "docs": "/docs"
     }
 
@@ -198,29 +215,8 @@ def get_models(league: str):
     return models
 
 
-@app.post("/api/predict", response_model=MatchPrediction, tags=["Predictions"])
-def predict_match(request: PredictRequest):
-    """
-    Predict the outcome of a football match.
-    
-    Returns predictions for multiple betting markets including:
-    - **match_result**: Home/Draw/Away (1X2)
-    - **over_under_25**: Over/Under 2.5 goals
-    - **btts**: Both Teams to Score
-    - **double_chance_1x**: Home or Draw
-    - **double_chance_x2**: Draw or Away
-    - **goals_bucket**: 0-1, 2-3, 4+ goals
-    - **ht_result**: Half-Time Result
-    - **home_clean_sheet**: Will home team keep a clean sheet
-    - **away_clean_sheet**: Will away team keep a clean sheet
-    - **home_win_to_nil**: Home win without conceding
-    - **away_win_to_nil**: Away win without conceding
-    - **over_under_15**: Over/Under 1.5 goals
-    - **over_under_35**: Over/Under 3.5 goals
-    - **ht_double_chance_1x**: Half-Time Double Chance 1X
-    """
-    service = get_service()
-    
+def do_predict_match(service: PredictionService, request: PredictRequest) -> MatchPrediction:
+    """Validate and predict one fixture. Shared by /api/predict and /api/predict/batch."""
     # Validate league
     if request.league not in service.models:
         raise HTTPException(
@@ -267,6 +263,136 @@ def predict_match(request: PredictRequest):
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Prediction error: {str(e)}")
+
+
+@app.post("/api/predict", response_model=MatchPrediction, tags=["Predictions"])
+def predict_match(request: PredictRequest):
+    """
+    Predict the outcome of a football match.
+    
+    Returns predictions for multiple betting markets including:
+    - **match_result**: Home/Draw/Away (1X2)
+    - **over_under_25**: Over/Under 2.5 goals
+    - **btts**: Both Teams to Score
+    - **double_chance_1x**: Home or Draw
+    - **double_chance_x2**: Draw or Away
+    - **goals_bucket**: 0-1, 2-3, 4+ goals
+    - **ht_result**: Half-Time Result
+    - **home_clean_sheet**: Will home team keep a clean sheet
+    - **away_clean_sheet**: Will away team keep a clean sheet
+    - **home_win_to_nil**: Home win without conceding
+    - **away_win_to_nil**: Away win without conceding
+    - **over_under_15**: Over/Under 1.5 goals
+    - **over_under_35**: Over/Under 3.5 goals
+    - **ht_double_chance_1x**: Half-Time Double Chance 1X
+    """
+    service = get_service()
+    return do_predict_match(service, request)
+
+
+class BatchMatchInput(BaseModel):
+    """One fixture inside a batch predict request. Per-match odds are optional."""
+    home_team: str = Field(..., description="Home team name", example="Arsenal")
+    away_team: str = Field(..., description="Away team name", example="Chelsea")
+    odds: Optional[OddsInput] = Field(None, description="Bookmaker odds for this match (optional)")
+
+
+class BatchPredictRequest(BaseModel):
+    """Request to predict many matches of one league in a single call."""
+    league: str = Field(..., description="League key (e.g., 'epl', 'bundesliga1')", example="epl")
+    matches: List[BatchMatchInput] = Field(..., description="Fixtures to predict (1-100)")
+    markets: Optional[List[str]] = Field(None, description="Specific markets to predict (default: all)")
+
+
+class BatchMatchResult(BaseModel):
+    """Outcome of one match inside a batch response."""
+    index: int
+    status: str = Field(..., description="'ok' or 'error'")
+    elapsed_ms: int
+    error: Optional[str] = None
+    prediction: Optional[MatchPrediction] = None
+
+
+class BatchPredictResponse(BaseModel):
+    """Batch prediction response: one result per requested match, in order."""
+    league: str
+    league_key: str
+    markets: List[str]
+    total: int
+    ok: int
+    failed: int
+    elapsed_ms: int
+    results: List[BatchMatchResult]
+
+
+@app.post("/api/predict/batch", response_model=BatchPredictResponse, tags=["Predictions"])
+def predict_matches_batch(request: BatchPredictRequest):
+    """
+    Predict many matches of a single league in one call.
+    
+    Every fixture is processed sequentially and validated independently: a bad
+    team name fails only its own entry and never aborts the batch. Results come
+    back in request order.
+    """
+    service = get_service()
+    
+    if request.league not in service.models:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No models for league '{request.league}'. Available: {list(service.models.keys())}"
+        )
+    
+    if not request.matches:
+        raise HTTPException(status_code=400, detail="'matches' must contain at least one fixture")
+    if len(request.matches) > 100:
+        raise HTTPException(status_code=400, detail="'matches' is limited to 100 fixtures per batch")
+    
+    started = time.perf_counter()
+    batch_results: List[BatchMatchResult] = []
+    
+    for idx, m in enumerate(request.matches):
+        one = PredictRequest(
+            league=request.league,
+            home_team=m.home_team.strip(),
+            away_team=m.away_team.strip(),
+            markets=request.markets,
+            odds=m.odds,
+        )
+        t0 = time.perf_counter()
+        try:
+            prediction = do_predict_match(service, one)
+            batch_results.append(BatchMatchResult(
+                index=idx,
+                status="ok",
+                elapsed_ms=int((time.perf_counter() - t0) * 1000),
+                prediction=prediction,
+            ))
+        except HTTPException as e:
+            batch_results.append(BatchMatchResult(
+                index=idx,
+                status="error",
+                elapsed_ms=int((time.perf_counter() - t0) * 1000),
+                error=str(e.detail),
+            ))
+        except Exception as e:
+            batch_results.append(BatchMatchResult(
+                index=idx,
+                status="error",
+                elapsed_ms=int((time.perf_counter() - t0) * 1000),
+                error=f"Prediction error: {str(e)}",
+            ))
+    
+    ok = sum(1 for r in batch_results if r.status == "ok")
+    return BatchPredictResponse(
+        league=LEAGUE_NAME.get(request.league, request.league),
+        league_key=request.league,
+        markets=request.markets or [],
+        total=len(batch_results),
+        ok=ok,
+        failed=len(batch_results) - ok,
+        elapsed_ms=int((time.perf_counter() - started) * 1000),
+        results=batch_results,
+    )
 
 
 @app.post("/api/compare", response_model=TeamComparison, tags=["Analysis"])
@@ -371,6 +497,18 @@ def health():
         "total_models": sum(len(m) for m in service.models.values()),
         "leagues": league_status
     }
+
+
+# =============================================================================
+# Test console UI (static files, no build step, no database)
+# =============================================================================
+
+FRONTEND_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "frontend"
+)
+
+if os.path.isdir(FRONTEND_DIR):
+    app.mount("/ui", StaticFiles(directory=FRONTEND_DIR, html=True), name="ui")
 
 
 # =============================================================================

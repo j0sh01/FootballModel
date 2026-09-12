@@ -489,15 +489,36 @@ class MarketModel:
 # =============================================================================
 
 class EnsembleModel:
-    """Ensemble of multiple models for a single market."""
+    """Ensemble of learners for a single market.
+
+    Exposes the same interface as `MarketModel` (`predict`, `predict_proba`,
+    `feature_names`, `label_encoder`, `market_type`, `results`), so callers can
+    treat a single model and a combined one interchangeably. Soft voting
+    averages member probabilities over a shared class-label order.
+    """
+
+    #: Preference order. The first available member supplies the reference
+    #: label encoder and feature order.
+    DEFAULT_MEMBERS = ['xgboost', 'random_forest', 'gradient_boosting']
     
-    def __init__(self, market_name: str, league: str, 
-                 model_types: List[str] = None):
+    def __init__(self, market_name: str, league: str,
+                 model_types: List[str] = None, method: str = 'soft'):
         self.market_name = market_name
         self.league = league
-        self.model_types = model_types or ['xgboost', 'random_forest', 'gradient_boosting']
-        self.models = {}
+        self.model_types = list(model_types) if model_types else list(self.DEFAULT_MEMBERS)
+        self.method = method or 'soft'
+        self.models: Dict[str, MarketModel] = {}
         self.results = {}
+
+        # MarketModel-compatible surface
+        self.model_type = 'ensemble'
+        self.market_type = MARKET_TYPES.get(market_name, 'classification')
+        self.features = MARKET_FEATURES.get(market_name, [])
+        self.target = MARKET_TARGETS.get(market_name)
+        self.feature_names = None
+        self.label_encoder = None
+        self.scaler = None
+        self.model = None
     
     def train(self, df: pd.DataFrame, save_dir: str = None) -> Dict:
         """Train all models in the ensemble."""
@@ -517,7 +538,7 @@ class EnsembleModel:
                 save_path = os.path.join(save_dir, f"{self.market_name}_{model_type}.pkl")
             
             model.train(df, save_path=save_path)
-            self.models[model_type] = model
+            self.add_model(model_type, model)
         
         return self.models
     
@@ -529,30 +550,26 @@ class EnsembleModel:
             X: Features
             method: 'hard' (majority vote) or 'soft' (average probabilities)
         """
+        method = (method or self.method or 'soft').lower()
+        members = self._ordered_members()
+        if not members:
+            raise ValueError("Ensemble has no members")
+
         if method == 'hard':
-            predictions = []
-            for model_type, model in self.models.items():
-                pred = model.predict(X)
-                predictions.append(pred)
-            
-            # Majority vote
-            predictions = np.array(predictions)
-            from scipy import stats
-            return stats.mode(predictions, axis=0)[0]
+            votes = np.concatenate([np.asarray(m.predict(X)).ravel() for _, m in members])
+            labels, counts = np.unique(votes, return_counts=True)
+            return np.array([labels[int(np.argmax(counts))]])
         
         else:  # soft
-            probas = []
-            for model_type, model in self.models.items():
-                if hasattr(model.model, 'predict_proba'):
-                    prob, _ = model.predict_proba(X)
-                    probas.append(prob)
+            voters = [mt for mt, m in self._ordered_members() if hasattr(m.model, 'predict_proba')]
             
-            if probas:
-                avg_proba = np.mean(probas, axis=0)
-                return np.argmax(avg_proba, axis=1)
-            else:
-                # Fallback to first model
-                return list(self.models.values())[0].predict(X)
+            if self.market_type == 'classification' and voters:
+                proba, labels = self._aligned_probabilities(X)
+                return np.array([labels[int(np.argmax(proba[0]))]])
+
+            # Regression, or no member exposes probabilities: average the values
+            values = np.array([np.asarray(m.predict(X), dtype=float) for _, m in members])
+            return values.mean(axis=0)
     
     def save(self, save_dir: str):
         """Save all models in the ensemble."""
@@ -562,18 +579,221 @@ class EnsembleModel:
             path = os.path.join(save_dir, f"{self.market_name}_{model_type}.pkl")
             model.save(path)
     
+    # -- members & MarketModel-compatible surface ---------------------------
+
+    def add_model(self, model_type: str, model: MarketModel) -> 'EnsembleModel':
+        """Register a member and refresh the derived attributes."""
+        self.models[model_type] = model
+        if model_type not in self.model_types:
+            self.model_types.append(model_type)
+        self._refresh()
+        return self
+
+    def _ordered_members(self) -> List[Tuple[str, MarketModel]]:
+        """Members sorted by preference, so xgboost leads when present."""
+        rank = {mt: i for i, mt in enumerate(self.DEFAULT_MEMBERS)}
+        return sorted(self.models.items(), key=lambda kv: rank.get(kv[0], len(rank)))
+
+    def _refresh(self):
+        """Recompute the MarketModel-compatible attributes from the members."""
+        members = [m for _, m in self._ordered_members()]
+        if not members:
+            return
+
+        ref = members[0]
+        self.label_encoder = ref.label_encoder
+        self.scaler = ref.scaler
+        self.model = ref.model
+        self.market_type = ref.market_type or self.market_type
+
+        # Union of member features, keeping the reference member's order
+        feats = list(ref.feature_names or [])
+        for member in members[1:]:
+            for name in (member.feature_names or []):
+                if name not in feats:
+                    feats.append(name)
+        self.feature_names = feats
+
+        self.results = self._aggregate_results()
+
+    def _aggregate_results(self) -> Dict:
+        """Score the ensemble on the holdout probabilities its members stored.
+
+        Members trained together by `train_league_models` were fitted on the
+        same split, so their saved `y_test`/`y_prob` line up and the ensemble's
+        own accuracy can be measured rather than guessed.
+        """
+        scored = [m for m in self.models.values() if m.results]
+        if not scored:
+            return {}
+
+        best = dict(max(scored, key=lambda m: m.results.get('accuracy', 0) or 0).results)
+
+        members = [m for m in self.models.values() if m.market_type == 'classification']
+        if len(members) < 2:
+            return best
+
+        unscored = {
+            'members': list(self.models.keys()),
+            'accuracy_note': 'members were trained on different data splits; retrain to score the ensemble',
+        }
+
+        y_tests = [m.results.get('y_test') for m in members]
+        y_probs = [m.results.get('y_prob') for m in members]
+        if any(y is None for y in y_tests) or any(p is None for p in y_probs):
+            return unscored
+
+        y_test = np.asarray(y_tests[0])
+        if any(np.asarray(y).shape != y_test.shape for y in y_tests):
+            # Members came from different data snapshots, so there is no single
+            # holdout to score on. Report it as unknown rather than passing off
+            # one member's accuracy as the ensemble's.
+            return unscored
+
+        probas = [np.asarray(p, dtype=float) for p in y_probs]
+        if any(p.ndim != 2 or p.shape != probas[0].shape for p in probas):
+            return unscored
+
+        avg_prob = np.mean(probas, axis=0)
+        y_pred = np.argmax(avg_prob, axis=1)
+        return {
+            'accuracy': float(accuracy_score(y_test, y_pred)),
+            'y_test': y_test.tolist(),
+            'y_pred': y_pred.tolist(),
+            'y_prob': avg_prob.tolist(),
+            'target_names': members[0].results.get('target_names'),
+            'members': list(self.models.keys()),
+        }
+
+    def _class_labels(self) -> List[str]:
+        """Class labels shared by the members, in a stable order."""
+        ref = self._ordered_members()[0][1]
+        if ref.label_encoder is not None:
+            return [str(c) for c in ref.label_encoder.classes_]
+        if ref.results.get('target_names'):
+            return [str(c) for c in ref.results['target_names']]
+        probs = ref.results.get('y_prob')
+        width = len(probs[0]) if probs else len(self.models)
+        return [str(i) for i in range(width)]
+
+    def _aligned_probabilities(self, X: pd.DataFrame) -> Tuple[np.ndarray, List[str]]:
+        """Average member probabilities over a common class-label order."""
+        labels = self._class_labels()
+        rows = []
+        for _, model in self._ordered_members():
+            proba, member_labels = model.predict_proba(X)
+            member_labels = [str(label) for label in member_labels]
+            row = np.asarray(proba, dtype=float)[0]
+            if member_labels != labels:
+                index = {label: i for i, label in enumerate(member_labels)}
+                if any(label not in index for label in labels):
+                    continue  # member has a different class space
+                row = np.asarray([row[index[label]] for label in labels])
+            rows.append(row)
+
+        if not rows:
+            proba, member_labels = self._ordered_members()[0][1].predict_proba(X)
+            return np.asarray(proba, dtype=float), [str(label) for label in member_labels]
+
+        avg = np.mean(rows, axis=0)
+        total = avg.sum()
+        return (avg / total if total > 0 else avg).reshape(1, -1), labels
+
+    def predict_proba(self, X: pd.DataFrame) -> Tuple[np.ndarray, List[str]]:
+        """Averaged class probabilities, shaped exactly like `MarketModel`'s."""
+        if self.market_type != 'classification':
+            raise ValueError("predict_proba only available for classification models")
+        return self._aligned_probabilities(X)
+
     @classmethod
     def load(cls, save_dir: str, market_name: str, league: str,
-             model_types: List[str] = None) -> 'EnsembleModel':
+             model_types: List[str] = None, method: str = 'soft') -> 'EnsembleModel':
         """Load ensemble from disk."""
-        instance = cls(market_name, league, model_types or [])
+        instance = cls(market_name, league, model_types, method=method)
         
         for model_type in instance.model_types:
             path = os.path.join(save_dir, f"{market_name}_{model_type}.pkl")
             if os.path.exists(path):
-                instance.models[model_type] = MarketModel.load(path)
+                instance.add_model(model_type, MarketModel.load(path))
         
         return instance
+
+
+# =============================================================================
+# MODEL DISCOVERY & LOADING
+# =============================================================================
+
+#: Longest suffix first, so 'gradient_boosting' is not read as 'boosting'.
+MODEL_TYPE_SUFFIXES = [
+    'gradient_boosting', 'random_forest', 'logistic_regression',
+    'xgboost', 'ridge', 'mlp',
+]
+
+
+def parse_model_filename(filename: str) -> Optional[Tuple[str, str]]:
+    """Split `<market>_<model_type>.pkl` into `(market, model_type)`.
+
+    Returns None for files that do not follow the convention.
+    """
+    if not filename.endswith('.pkl'):
+        return None
+
+    basename = filename[: -len('.pkl')]
+    for model_type in MODEL_TYPE_SUFFIXES:
+        if basename.endswith('_' + model_type):
+            return basename[: -len(model_type) - 1], model_type
+    return None
+
+
+def discover_market_models(league_dir: str) -> Dict[str, Dict[str, str]]:
+    """Map `market -> {model_type: path}` for every `.pkl` in a league dir."""
+    found: Dict[str, Dict[str, str]] = {}
+    if not os.path.isdir(league_dir):
+        return found
+
+    for filename in sorted(os.listdir(league_dir)):
+        parsed = parse_model_filename(filename)
+        if parsed is None:
+            continue
+        market, model_type = parsed
+        found.setdefault(market, {})[model_type] = os.path.join(league_dir, filename)
+
+    return found
+
+
+def load_market_model(market: str, league: str, paths: Dict[str, str],
+                      prefer: str = 'xgboost', ensemble: str = 'soft') -> Any:
+    """Load one market, combining algorithms into an ensemble when available.
+
+    Args:
+        market: Market identifier (e.g. 'match_result')
+        league: League identifier (e.g. 'epl')
+        paths: model_type -> path, as returned by `discover_market_models`
+        prefer: algorithm to use when combining is off or unavailable
+        ensemble: 'soft'/'hard' to combine members, 'off' for a single model
+
+    Returns:
+        An `EnsembleModel` when several algorithms exist and combining is on,
+        otherwise a single `MarketModel`.
+    """
+    available = list(paths)
+    if not available:
+        raise ValueError(f"No model files for '{market}' ({league})")
+
+    # Stable preference order, so the member list and the single-model fallback
+    # do not depend on the order the files happened to be listed in.
+    rank = {mt: i for i, mt in enumerate(EnsembleModel.DEFAULT_MEMBERS)}
+    available.sort(key=lambda mt: rank.get(mt, len(rank)))
+
+    mode = (ensemble or 'off').strip().lower()
+    if mode in ('soft', 'hard') and len(available) > 1:
+        combined = EnsembleModel(market, league, model_types=available, method=mode)
+        for model_type in available:
+            combined.add_model(model_type, MarketModel.load(paths[model_type]))
+        return combined
+
+    chosen = prefer if prefer in paths else available[0]
+    return MarketModel.load(paths[chosen])
 
 
 # =============================================================================
@@ -742,23 +962,16 @@ def predict_match(home_team: str, away_team: str,
         try:
             feature_df = pd.DataFrame([features])
             
-            if isinstance(model, EnsembleModel):
-                pred = model.predict(feature_df)
-            else:
-                pred = model.predict(feature_df)
-                # pred is already decoded to label strings by MarketModel.predict()
-            
+            # EnsembleModel.predict() mirrors MarketModel.predict() and returns
+            # decoded label strings for classification markets.
+            pred = model.predict(feature_df)
+
             if model.market_type == 'classification':
                 proba_result = model.predict_proba(feature_df) if hasattr(model, 'predict_proba') else None
                 proba = proba_result[0] if proba_result is not None else None
                 class_labels = proba_result[1] if proba_result is not None else None
-                
-                # For EnsembleModel, pred is already encoded, need to decode
-                if isinstance(model, EnsembleModel) and model.label_encoder is not None:
-                    pred_label = model.label_encoder.inverse_transform(pred.astype(int))[0]
-                else:
-                    # MarketModel.predict() already decodes
-                    pred_label = pred[0] if hasattr(pred, '__getitem__') else pred
+
+                pred_label = pred[0] if hasattr(pred, '__getitem__') else pred
                 
                 pred_dict = {
                     'prediction': str(pred_label),

@@ -51,6 +51,9 @@ models/
 # Outputs (regenerate with notebooks)
 outputs/
 
+# Local model backups (snapshots taken before a retrain)
+backups/
+
 # Legacy model files at root
 *.pkl
 

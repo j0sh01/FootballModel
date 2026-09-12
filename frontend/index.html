@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Football Model · Test Console</title>
+  <meta name="description" content="Testing console for the football prediction model API" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='14' fill='%23111620' stroke='%2334d399' stroke-width='2'/%3E%3Cpath d='M16 6l6 4-2 7h-8l-2-7z' fill='%2334d399'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 32 32" width="26" height="26">
+          <circle cx="16" cy="16" r="13.5" fill="none" stroke="currentColor" stroke-width="2" />
+          <path d="M16 5.5l6.2 4.2-2.4 7.3h-7.6L9.8 9.7z" fill="currentColor" />
+          <path d="M16 26.5l-5.6-3.9 1.4-4.1h8.4l1.4 4.1z" fill="currentColor" opacity=".55" />
+        </svg>
+      </span>
+      <span class="brand-text">
+        <strong>Football Model</strong>
+        <small>Prediction Test Console</small>
+      </span>
+    </div>
+
+    <div class="topbar-actions">
+      <label class="field inline api-base">
+        <span>API base</span>
+        <input id="apiBase" type="text" inputmode="url" spellcheck="false" placeholder="same origin" />
+      </label>
+
+      <div id="healthPill" class="pill pill--idle" title="API status">
+        <i class="dot"></i><span id="healthText">Connecting…</span>
+      </div>
+
+      <button id="refreshStatus" class="btn btn--ghost btn--icon" title="Re-check API status" aria-label="Re-check API status">⟳</button>
+      <button id="themeToggle" class="btn btn--ghost btn--icon" title="Toggle theme" aria-label="Toggle theme">◐</button>
+    </div>
+  </header>
+
+  <nav class="tabs" role="tablist" aria-label="Sections">
+    <button class="tab is-active" role="tab" aria-selected="true" data-tab="predict">Predict</button>
+    <button class="tab" role="tab" aria-selected="false" data-tab="compare">Compare</button>
+    <button class="tab" role="tab" aria-selected="false" data-tab="models">Models</button>
+    <button class="tab" role="tab" aria-selected="false" data-tab="activity">Activity</button>
+  </nav>
+
+  <main id="main">
+    <!-- ============================= PREDICT ============================= -->
+    <section class="panel is-active" id="tab-predict" role="tabpanel" aria-label="Predict">
+      <form id="predictForm" class="grid grid--form" autocomplete="off">
+        <div class="card">
+          <div class="card-head">
+            <h2>League &amp; markets</h2>
+            <p class="muted small">Everything in the queue is predicted for this league.</p>
+          </div>
+
+          <div class="field">
+            <label for="league">League</label>
+            <select id="league"><option value="">Loading leagues…</option></select>
+            <small class="hint" id="leagueHint"></small>
+          </div>
+
+          <div class="field">
+            <div class="head-row">
+              <label>Markets</label>
+              <div class="mini-actions">
+                <button type="button" class="linkbtn" id="marketsAll">all</button>
+                <span class="muted">·</span>
+                <button type="button" class="linkbtn" id="marketsNone">none</button>
+                <span class="muted">·</span>
+                <button type="button" class="linkbtn" id="marketsTrained">trained only</button>
+              </div>
+            </div>
+            <div id="marketChips" class="chips" aria-label="Markets to predict"></div>
+          </div>
+
+          <p class="hint muted small" id="predictState"></p>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>Match queue</h2>
+            <p class="muted small">Add as many fixtures as you want, then run them all in one go. Odds are optional and stored per match.</p>
+          </div>
+
+          <div class="field-row">
+            <div class="field">
+              <label for="homeTeam">Home team</label>
+              <input id="homeTeam" list="teamList" placeholder="e.g. Arsenal" spellcheck="false" />
+            </div>
+            <div class="field">
+              <label for="awayTeam">Away team</label>
+              <input id="awayTeam" list="teamList" placeholder="e.g. Chelsea" spellcheck="false" />
+            </div>
+          </div>
+          <datalist id="teamList"></datalist>
+
+          <button type="button" class="linkbtn queue-odds-toggle" id="queueOddsToggle">+ odds for this match (optional)</button>
+          <div id="queueOdds" class="queue-odds" hidden>
+            <fieldset class="fieldset">
+              <legend>1X2 odds</legend>
+              <div class="field-row field-row--3">
+                <div class="field"><label for="oddsHome">Home</label><input id="oddsHome" type="number" step="0.01" min="1.01" placeholder="1.85" /></div>
+                <div class="field"><label for="oddsDraw">Draw</label><input id="oddsDraw" type="number" step="0.01" min="1.01" placeholder="3.60" /></div>
+                <div class="field"><label for="oddsAway">Away</label><input id="oddsAway" type="number" step="0.01" min="1.01" placeholder="4.20" /></div>
+              </div>
+            </fieldset>
+            <fieldset class="fieldset">
+              <legend>Goals &amp; handicap odds</legend>
+              <div class="field-row field-row--2">
+                <div class="field"><label for="oddsOver">Over 2.5</label><input id="oddsOver" type="number" step="0.01" min="1.01" placeholder="1.75" /></div>
+                <div class="field"><label for="oddsUnder">Under 2.5</label><input id="oddsUnder" type="number" step="0.01" min="1.01" placeholder="2.10" /></div>
+              </div>
+              <div class="field-row field-row--2">
+                <div class="field"><label for="oddsAhHome">AH home</label><input id="oddsAhHome" type="number" step="0.01" min="1.01" placeholder="1.90" /></div>
+                <div class="field"><label for="oddsAhAway">AH away</label><input id="oddsAhAway" type="number" step="0.01" min="1.01" placeholder="1.95" /></div>
+              </div>
+            </fieldset>
+          </div>
+
+          <div class="actions">
+            <button type="button" class="btn btn--primary" id="addMatch">+ Add to queue</button>
+            <button type="button" class="btn btn--ghost" id="swapTeams" title="Swap home and away">⇄ Swap</button>
+            <button type="button" class="btn btn--ghost" id="randomFixture">🎲 Random fixture</button>
+          </div>
+        </div>
+      </form>
+
+      <div class="card queue-bar" id="queueBar" hidden>
+        <div class="head-row">
+          <div class="queue-summary">
+            <strong id="queueCount">0 matches</strong>
+            <span class="muted small" id="queueSummaryText"></span>
+          </div>
+          <div class="mini-actions">
+            <button type="button" class="btn btn--primary" id="predictAll">▶ Predict all</button>
+            <button type="button" class="btn btn--ghost btn--small" id="clearQueue">Clear queue</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="queueList" class="queue-list" aria-label="Queued matches"></div>
+
+      <div id="predictResults" class="results" aria-live="polite">
+        <div class="empty">
+          <h3>No predictions yet</h3>
+          <p>Add fixtures to the queue and hit <strong>Predict all</strong>. Every match gets its own result card with probabilities, fair odds and model metadata.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================= COMPARE ============================= -->
+    <section class="panel" id="tab-compare" role="tabpanel" aria-label="Compare" hidden>
+      <form id="compareForm" class="grid grid--form" autocomplete="off">
+        <div class="card">
+          <div class="card-head">
+            <h2>Team comparison</h2>
+            <p class="muted small">Form, H2H, streaks, attack/defense strength and goal timing over recent matches.</p>
+          </div>
+          <div class="field">
+            <label for="cmpLeague">League</label>
+            <select id="cmpLeague"></select>
+          </div>
+          <div class="field-row">
+            <div class="field"><label for="cmpHome">Home team</label><input id="cmpHome" list="teamList" spellcheck="false" /></div>
+            <div class="field"><label for="cmpAway">Away team</label><input id="cmpAway" list="teamList" spellcheck="false" /></div>
+          </div>
+          <div class="actions">
+            <button type="submit" class="btn btn--primary" id="runCompare">Compare teams</button>
+            <button type="button" class="btn btn--ghost" id="copyCompareTeams">Copy from Predict tab</button>
+          </div>
+          <p class="hint muted small" id="compareState"></p>
+        </div>
+      </form>
+      <div id="compareResults" class="results" aria-live="polite">
+        <div class="empty">
+          <h3>Nothing compared yet</h3>
+          <p>Choose two teams to see the underlying model features side by side.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================= MODELS ============================= -->
+    <section class="panel" id="tab-models" role="tabpanel" aria-label="Models" hidden>
+      <div class="card">
+        <div class="card-head">
+          <h2>Trained models</h2>
+          <p class="muted small">Walk-forward metrics reported by each saved model. Use this to sanity-check what the API loaded.</p>
+        </div>
+        <div class="field-row field-row--2">
+          <div class="field">
+            <label for="modelLeague">League</label>
+            <select id="modelLeague"></select>
+          </div>
+          <div class="field">
+            <label for="modelSearch">Filter</label>
+            <input id="modelSearch" placeholder="market or model type…" spellcheck="false" />
+          </div>
+        </div>
+        <div id="modelSummary" class="stat-row"></div>
+      </div>
+      <div class="card">
+        <div class="table-wrap">
+          <table class="table" id="modelsTable">
+            <thead>
+              <tr>
+                <th data-sort="market">Market</th>
+                <th data-sort="model_type">Model</th>
+                <th data-sort="market_type">Type</th>
+                <th data-sort="accuracy" class="num">Accuracy</th>
+                <th data-sort="mae" class="num">MAE</th>
+                <th data-sort="n_features" class="num">Features</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td colspan="6" class="muted center">Select a league to load its models.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card" id="accuracyCard" hidden>
+        <div class="card-head"><h2>Accuracy by market</h2><p class="muted small">Classification accuracy (or MAE for regressors) per market.</p></div>
+        <div id="accuracyChart" class="chart"></div>
+      </div>
+    </section>
+
+    <!-- ============================= ACTIVITY ============================= -->
+    <section class="panel" id="tab-activity" role="tabpanel" aria-label="Activity" hidden>
+      <div class="grid grid--two">
+        <div class="card">
+          <div class="card-head">
+            <h2>API health</h2>
+            <p class="muted small">Raw response from <code>/api/health</code>.</p>
+          </div>
+          <div id="healthBlock" class="json">Not loaded.</div>
+        </div>
+        <div class="card">
+          <div class="card-head">
+            <h2>Last response</h2>
+            <div class="head-row">
+              <p class="muted small">Inspect the exact JSON the models returned.</p>
+              <button type="button" class="btn btn--ghost btn--small" id="copyLast">Copy JSON</button>
+            </div>
+          </div>
+          <div id="lastResponseBlock" class="json">Nothing yet.</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <div class="head-row">
+            <h2>Request log <span class="muted small" id="logCount"></span></h2>
+            <div class="mini-actions">
+              <button type="button" class="btn btn--ghost btn--small" id="exportJson">Export runs (JSON)</button>
+              <button type="button" class="btn btn--ghost btn--small" id="exportCsv">Export runs (CSV)</button>
+              <button type="button" class="btn btn--ghost btn--small" id="clearLog">Clear</button>
+            </div>
+          </div>
+          <p class="muted small">Every call made by this console, with status and latency. Runs are kept in memory and in <code>localStorage</code> — no database involved.</p>
+        </div>
+        <div class="table-wrap">
+          <table class="table" id="logTable">
+            <thead>
+              <tr><th>Time</th><th>Method</th><th>Endpoint</th><th class="num">Status</th><th class="num">ms</th><th>Note</th></tr>
+            </thead>
+            <tbody><tr><td colspan="6" class="muted center">No requests logged yet.</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <div class="head-row">
+            <h2>Prediction history</h2>
+            <button type="button" class="btn btn--ghost btn--small" id="clearHistory">Clear history</button>
+          </div>
+          <p class="muted small">Comparable summaries of past runs — useful when you are re-testing the same fixture after retraining.</p>
+        </div>
+        <div id="historyBlock" class="results"></div>
+      </div>
+    </section>
+  </main>
+
+  <div id="toasts" class="toasts" aria-live="polite" aria-atomic="true"></div>
+
+  <footer class="footer">
+    <span>Football Prediction System · test console</span>
+    <span class="muted">Served by FastAPI · <a href="docs" target="_blank" rel="noopener">API docs</a> · <span id="apiVersion"></span></span>
+  </footer>
+
+  <script src="app.js" defer></script>
+</body>
+</html>

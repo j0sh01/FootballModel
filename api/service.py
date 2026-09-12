@@ -21,11 +21,20 @@ from src.feature_engineering import (
     calculate_clean_sheet_prob, calculate_attack_defense_strength,
     calculate_league_position_proxy
 )
-from src.market_models import MarketModel, compare_teams as _compare_teams, print_team_comparison
+from src.market_models import (
+    MarketModel, EnsembleModel, discover_market_models, load_market_model,
+    compare_teams as _compare_teams, print_team_comparison
+)
 
 
 MODELS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'models')
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data')
+
+#: How to combine algorithms when a market has several trained models.
+#: 'soft' averages probabilities, 'hard' majority-votes, 'off' loads one model.
+ENSEMBLE_MODE = os.environ.get('ENSEMBLE_MODE', 'soft').strip().lower()
+#: Single model type used when ensembling is off or a market has one algorithm.
+PREFERRED_MODEL_TYPE = os.environ.get('PREFERRED_MODEL_TYPE', 'xgboost').strip().lower()
 
 
 class PredictionService:
@@ -44,7 +53,8 @@ class PredictionService:
             return
         self._initialized = True
         
-        self.models: Dict[str, Dict[str, MarketModel]] = {}  # league -> market -> model
+        # league -> market -> MarketModel | EnsembleModel
+        self.models: Dict[str, Dict[str, Any]] = {}
         self.league_data: Dict[str, pd.DataFrame] = {}  # league -> engineered df
         self.elos: Dict[str, Dict[str, int]] = {}  # league -> team -> elo
         self.teams: Dict[str, List[str]] = {}  # league -> team names
@@ -55,6 +65,8 @@ class PredictionService:
         """Load all trained models from disk."""
         print("Loading trained models...")
         
+        discovered: Dict[str, Dict[str, Dict[str, str]]] = {}
+
         for league in LEAGUE_CONFIG:
             league_dir = os.path.join(MODELS_DIR, league)
             if not os.path.exists(league_dir):
@@ -62,36 +74,31 @@ class PredictionService:
             
             self.models[league] = {}
             
-            for f in os.listdir(league_dir):
-                if not f.endswith('.pkl'):
-                    continue
-                
-                basename = f.replace('.pkl', '')
-                model_type = None
-                market = None
-                
-                # Match longest model type first
-                for mt in ['gradient_boosting', 'random_forest', 'xgboost']:
-                    if basename.endswith('_' + mt):
-                        model_type = mt
-                        market = basename[:-len(mt)-1]
-                        break
-                
-                if model_type is None:
-                    continue
-                
-                # Prefer xgboost, then random_forest, then gradient_boosting
-                if market not in self.models[league] or model_type == 'xgboost':
-                    try:
-                        path = os.path.join(league_dir, f)
-                        model = MarketModel.load(path)
-                        self.models[league][market] = model
-                    except Exception as e:
-                        print(f"  Error loading {f}: {e}")
+            # Collect every algorithm; each market is built in the second pass
+            for market, paths in discover_market_models(league_dir).items():
+                discovered.setdefault(league, {})[market] = paths
         
+        # Build one model (single or combined) per market
+        for league, markets in discovered.items():
+            if league not in self.models:
+                continue
+            for market, paths in markets.items():
+                try:
+                    self.models[league][market] = load_market_model(
+                        market, league, paths,
+                        prefer=PREFERRED_MODEL_TYPE, ensemble=ENSEMBLE_MODE
+                    )
+                except Exception as e:
+                    print(f"  Error loading {league}/{market}: {e}")
+
         # Print summary
+        n_ensembles = sum(
+            1 for markets in self.models.values()
+            for model in markets.values() if isinstance(model, EnsembleModel)
+        )
         total_models = sum(len(markets) for markets in self.models.values())
-        print(f"Loaded {total_models} models across {len(self.models)} leagues")
+        print(f"Loaded {total_models} markets across {len(self.models)} leagues "
+              f"({n_ensembles} ensembles, mode={ENSEMBLE_MODE})")
     
     def _ensure_league_data(self, league: str):
         """Load and engineer features for a league if not already done."""
@@ -147,14 +154,17 @@ class PredictionService:
         models_info = []
         for market, model in self.models[league].items():
             results = model.results or {}
-            models_info.append({
+            info = {
                 'market': market,
                 'model_type': model.model_type,
                 'market_type': model.market_type,
                 'accuracy': results.get('accuracy'),
                 'mae': results.get('mae'),
                 'n_features': len(model.feature_names) if model.feature_names else 0
-            })
+            }
+            if isinstance(model, EnsembleModel):
+                info['members'] = list(model.models.keys())
+            models_info.append(info)
         
         return models_info
     
@@ -213,6 +223,8 @@ class PredictionService:
                     'model_type': model.model_type,
                     'market_type': model.market_type
                 }
+                if isinstance(model, EnsembleModel):
+                    result['members'] = list(model.models.keys())
                 
                 # Get probabilities for classification
                 if model.market_type == 'classification':
